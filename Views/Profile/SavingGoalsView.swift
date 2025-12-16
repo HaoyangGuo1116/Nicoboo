@@ -1,6 +1,7 @@
 import SwiftUI
 import SwiftData
 import FirebaseAuth
+import FirebaseFirestore
 
 struct SavingGoalsView: View {
     @Environment(\.dismiss) private var dismiss
@@ -11,12 +12,23 @@ struct SavingGoalsView: View {
     @State private var showAddGoalSheet = false
     @State private var selectedPresetGoal: (name: String, amount: Double, imageName: String)?
     @State private var refreshTrigger = UUID()
+    @State private var isLoading = false
+    @State private var firebaseGoals: [SavingGoal] = [] // Fallback if SwiftData fails
     
     private var goals: [SavingGoal] {
         let currentUserId = appState.isAuthenticated ? FirebaseAuthService.shared.currentUser?.uid : nil
-        return allGoals.filter { goal in
+        
+        // Try to use SwiftData goals first
+        let localGoals = allGoals.filter { goal in
             goal.userId == currentUserId
         }
+        
+        // If we have Firebase fallback goals and local goals are empty, use Firebase goals
+        if localGoals.isEmpty && !firebaseGoals.isEmpty {
+            return firebaseGoals
+        }
+        
+        return localGoals
     }
     
     var body: some View {
@@ -51,8 +63,10 @@ struct SavingGoalsView: View {
             .sheet(isPresented: $showAddGoalSheet) {
                 if let preset = selectedPresetGoal {
                     AddGoalView(presetGoal: preset, onSave: {
-                        // Force refresh after save
-                        refreshTrigger = UUID()
+                        // Force refresh after save by reloading from Firebase
+                        Task {
+                            await loadGoalsFromFirebase()
+                        }
                     })
                         .environment(\.modelContext, context)
                         .environmentObject(appState)
@@ -70,6 +84,81 @@ struct SavingGoalsView: View {
                     refreshTrigger = UUID()
                 }
             }
+            .task {
+                await loadGoalsFromFirebase()
+            }
+        }
+    }
+    
+    private func loadGoalsFromFirebase() async {
+        guard let userId = appState.isAuthenticated ? FirebaseAuthService.shared.currentUser?.uid : nil else {
+            return
+        }
+        
+        isLoading = true
+        defer { isLoading = false }
+        
+        do {
+            let firebaseGoals = try await FirebaseAuthService.shared.loadSavingGoals(userId: userId)
+            print("Loaded \(firebaseGoals.count) goals from Firebase")
+            
+            // Get existing goal IDs from local storage (on main thread)
+            let existingGoalIds = await MainActor.run {
+                Set(allGoals.map { $0.id.uuidString })
+            }
+            
+            // Sync Firebase goals to local storage
+            await MainActor.run {
+                var goalsToDisplay: [SavingGoal] = []
+                var newGoalsCount = 0
+                
+                for firebaseGoal in firebaseGoals {
+                    guard let goalIdString = firebaseGoal["id"] as? String,
+                          let goalId = UUID(uuidString: goalIdString),
+                          let name = firebaseGoal["name"] as? String,
+                          let targetAmount = firebaseGoal["targetAmount"] as? Double else {
+                        continue
+                    }
+                    
+                    let createdAt = (firebaseGoal["createdAt"] as? Timestamp)?.dateValue() ?? Date()
+                    let imageName = firebaseGoal["imageName"] as? String
+                    
+                    let goal = SavingGoal(
+                        id: goalId,
+                        userId: userId,
+                        name: name,
+                        targetAmount: targetAmount,
+                        imageName: imageName,
+                        createdAt: createdAt
+                    )
+                    
+                    goalsToDisplay.append(goal)
+                    
+                    // Try to save to SwiftData if not already exists
+                    if !existingGoalIds.contains(goalIdString) {
+                        do {
+                            context.insert(goal)
+                            try context.save()
+                            newGoalsCount += 1
+                        } catch {
+                            print("Failed to save goal to SwiftData, will use Firebase fallback: \(error.localizedDescription)")
+                            // Don't fail - we'll use the goals from Firebase directly
+                        }
+                    }
+                }
+                
+                // Update Firebase fallback goals in case SwiftData is not working
+                self.firebaseGoals = goalsToDisplay
+                
+                if newGoalsCount > 0 {
+                    print("Synced \(newGoalsCount) new goals from Firebase to local storage")
+                }
+                
+                // Force UI refresh
+                refreshTrigger = UUID()
+            }
+        } catch {
+            print("Failed to load goals from Firebase: \(error.localizedDescription)")
         }
     }
     
@@ -106,7 +195,16 @@ struct SavingGoalsView: View {
     private var goalsList: some View {
         VStack(spacing: AppSpacing.medium) {
             ForEach(goals) { goal in
-                GoalCardView(goal: goal)
+                GoalCardView(goal: goal, onDelete: { deletedGoalId in
+                    // Immediately remove from firebaseGoals state for instant UI update
+                    Task { @MainActor in
+                        firebaseGoals.removeAll { $0.id.uuidString == deletedGoalId }
+                        refreshTrigger = UUID()
+                        
+                        // Then reload from Firebase to ensure consistency
+                        await loadGoalsFromFirebase()
+                    }
+                })
                     .environmentObject(appState)
             }
         }
@@ -133,8 +231,14 @@ struct SavingGoalsView: View {
 // MARK: - Goal Card View
 struct GoalCardView: View {
     let goal: SavingGoal
+    let onDelete: ((String) -> Void)?
     @EnvironmentObject var appState: AppState
     @Environment(\.modelContext) private var context
+    
+    init(goal: SavingGoal, onDelete: ((String) -> Void)? = nil) {
+        self.goal = goal
+        self.onDelete = onDelete
+    }
     
     private var currentMoneySaved: Double {
         guard let profile = appState.userProfile,
@@ -185,8 +289,7 @@ struct GoalCardView: View {
                     Spacer()
                     
                     Button(action: {
-                        context.delete(goal)
-                        try? context.save()
+                        deleteGoal()
                     }) {
                         Image(systemName: "trash")
                             .foregroundStyle(.red)
@@ -225,6 +328,40 @@ struct GoalCardView: View {
         formatter.numberStyle = .currency
         formatter.currencyCode = appState.userProfile?.currencyCode ?? "USD"
         return formatter.string(from: NSNumber(value: value)) ?? "$0.00"
+    }
+    
+    private func deleteGoal() {
+        let goalId = goal.id.uuidString
+        let userId = appState.isAuthenticated ? FirebaseAuthService.shared.currentUser?.uid : nil
+        
+        // Immediately notify parent to remove from UI (optimistic update)
+        onDelete?(goalId)
+        
+        // Delete from local storage (SwiftData)
+        do {
+            context.delete(goal)
+            try context.save()
+            print("Successfully deleted goal from local storage")
+        } catch {
+            print("Failed to delete goal from local storage: \(error.localizedDescription)")
+            // Continue to delete from Firebase anyway
+        }
+        
+        // Delete from Firebase if authenticated
+        if let userId = userId {
+            Task {
+                do {
+                    try await FirebaseAuthService.shared.deleteSavingGoal(
+                        userId: userId,
+                        goalId: goalId
+                    )
+                    print("Successfully deleted goal from Firebase")
+                } catch {
+                    print("Failed to delete goal from Firebase: \(error.localizedDescription)")
+                    // UI already updated, so we'll just log the error
+                }
+            }
+        }
     }
 }
 
@@ -353,36 +490,105 @@ struct AddGoalView: View {
         
         let userId = appState.isAuthenticated ? FirebaseAuthService.shared.currentUser?.uid : nil
         
-        let goal = SavingGoal(
-            userId: userId,
-            name: goalName,
-            targetAmount: amount,
-            imageName: presetGoal?.imageName
-        )
+        // Create goal with a new UUID
+        let goalId = UUID()
+        let createdAt = Date()
         
-        // Insert the goal
-        context.insert(goal)
-        
-        // Save and handle result
-        do {
-            try context.save()
-            // Trigger refresh callback
-            onSave?()
-            // Dismiss after a brief delay to ensure UI updates
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                dismiss()
+        // Always save to Firebase first (this is the primary storage)
+        if let userId = userId {
+            Task {
+                do {
+                    try await FirebaseAuthService.shared.saveSavingGoal(
+                        userId: userId,
+                        goalId: goalId.uuidString,
+                        name: goalName,
+                        targetAmount: amount,
+                        imageName: presetGoal?.imageName,
+                        createdAt: createdAt
+                    )
+                    print("Successfully saved goal to Firebase")
+                    
+                    // Try to save to SwiftData (local storage) after Firebase succeeds
+                    await MainActor.run {
+                        let goal = SavingGoal(
+                            id: goalId,
+                            userId: userId,
+                            name: goalName,
+                            targetAmount: amount,
+                            imageName: presetGoal?.imageName,
+                            createdAt: createdAt
+                        )
+                        
+                        do {
+                            context.insert(goal)
+                            try context.save()
+                            print("Successfully saved goal to SwiftData")
+                        } catch {
+                            print("Failed to save goal to SwiftData (will sync from Firebase on reload): \(error.localizedDescription)")
+                            // If SwiftData fails, we'll still load from Firebase
+                        }
+                        
+                        // Trigger refresh callback and dismiss
+                        onSave?()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                            dismiss()
+                        }
+                    }
+                } catch {
+                    print("Failed to save goal to Firebase: \(error.localizedDescription)")
+                    // Even if Firebase fails, try to save locally
+                    await MainActor.run {
+                        let goal = SavingGoal(
+                            id: goalId,
+                            userId: userId,
+                            name: goalName,
+                            targetAmount: amount,
+                            imageName: presetGoal?.imageName,
+                            createdAt: createdAt
+                        )
+                        
+                        do {
+                            context.insert(goal)
+                            try context.save()
+                            print("Saved goal locally (Firebase save failed)")
+                            onSave?()
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                                dismiss()
+                            }
+                        } catch {
+                            print("Failed to save goal both locally and to Firebase: \(error.localizedDescription)")
+                            // Still dismiss - user will see error in console but UI will close
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                dismiss()
+                            }
+                        }
+                    }
+                }
             }
-        } catch {
-            print("Failed to save goal: \(error.localizedDescription)")
-            // Try saving again
+        } else {
+            // Not authenticated - only use local storage
+            let goal = SavingGoal(
+                id: goalId,
+                userId: nil,
+                name: goalName,
+                targetAmount: amount,
+                imageName: presetGoal?.imageName,
+                createdAt: createdAt
+            )
+            
             do {
+                context.insert(goal)
                 try context.save()
                 onSave?()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                     dismiss()
                 }
             } catch {
-                print("Retry save also failed: \(error.localizedDescription)")
+                print("Failed to save goal locally: \(error.localizedDescription)")
+                // Still dismiss
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    dismiss()
+                }
             }
         }
     }

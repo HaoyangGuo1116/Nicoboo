@@ -132,5 +132,37 @@ class FirebaseAuthService: ObservableObject {
             currencyCode: currencyCode
         )
     }
+    
+    // MARK: - Save Saving Goal to Firestore
+    func saveSavingGoal(userId: String, goalId: String, name: String, targetAmount: Double, imageName: String?, createdAt: Date) async throws {
+        var goalData: [String: Any] = [
+            "name": name,
+            "targetAmount": targetAmount,
+            "createdAt": Timestamp(date: createdAt),
+            "userId": userId
+        ]
+        
+        if let imageName = imageName {
+            goalData["imageName"] = imageName
+        }
+        
+        try await db.collection("users").document(userId).collection("savingGoals").document(goalId).setData(goalData, merge: true)
+    }
+    
+    // MARK: - Load Saving Goals from Firestore
+    func loadSavingGoals(userId: String) async throws -> [[String: Any]] {
+        let snapshot = try await db.collection("users").document(userId).collection("savingGoals").getDocuments()
+        
+        return snapshot.documents.compactMap { doc in
+            var data = doc.data()
+            data["id"] = doc.documentID
+            return data
+        }
+    }
+    
+    // MARK: - Delete Saving Goal from Firestore
+    func deleteSavingGoal(userId: String, goalId: String) async throws {
+        try await db.collection("users").document(userId).collection("savingGoals").document(goalId).delete()
+    }
 }
 
